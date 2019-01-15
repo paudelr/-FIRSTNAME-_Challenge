@@ -1,0 +1,237 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: False
+
+  vars:
+      instance_type: t2.micro
+      security_group: sec_grp_test01 
+      image: ami-0b500ef59d8335eee
+      keyname: id_rsa
+      region: us-east-2
+      count: 1
+
+  tasks:
+
+    - name: Create a security group
+      local_action: 
+        module: ec2_group
+        name: "{{ security_group }}"
+        description: Security Group for webserver Servers
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 8080
+            to_port: 8080
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+      register: basic_firewall
+
+    - name: Provision a set of instances
+      ec2:
+         group: "{{ security_group }}"
+         key_name: "{{ keyname }}"
+         instance_type: "{{ instance_type }}"
+         image: "{{ image }}"
+         wait: true
+         exact_count: "{{ count }}"
+         region: "{{ region }}"
+         count_tag:
+            Name: Test01
+         instance_tags:
+            Name: Test01
+      register: ec2
+
+    - name: Add all instance public IPs to host group
+      add_host: hostname={{ item.public_ip }} groups=ec2hosts
+      loop: "{{ ec2.instances }}"
+
+#    - name: Wait for SSH to come up
+#      local_action: wait_for
+#                    host= "{{ item.public_ip }}"
+#                    port=22
+#                    state=started
+#      with_items: "{{ ec2.instances }}"
+
+    - pause:
+        minutes: 2 
+
+- hosts: ec2hosts
+  name: configuration play
+  user: ec2-user
+  gather_facts: true
+  handlers:
+  - include: handlers/main.yml
+
+  vars:
+      ansible_tc_user: ec2-user
+      ansible_jdk_user: ec2-user
+      ansible_tc_installation_dir: /home/ec2-user/tomcat
+      ansible_jdk_installation_dir: /home/ec2-user/java
+      shutdown_port: 8005
+      http_port: 8080
+      https_port: 8443
+      ajp_port: 8009
+
+  tasks:
+
+
+# setyp java
+    - name: Create necessary directory {{ansible_jdk_installation_dir}}
+      file:
+        path={{ansible_jdk_installation_dir}}
+        state=directory
+      sudo: yes
+
+    - name: Copy the jdk installer over to the target machine
+      copy: 
+         src: "files/jdk-8u161-linux-x64.tar.gz"
+         dest: /home/ec2-user/java/ 
+         owner: "{{ansible_jdk_user}}"
+         group: "{{ansible_jdk_user}}"
+         mode: 0644
+
+    - name: Copy the jks over to the target machine
+      copy:
+         src: "files/ec2_keystore.jks"
+         dest: "/home/ec2-user/"
+         owner: "{{ansible_jdk_user}}"
+         group: "{{ansible_jdk_user}}"
+         mode: 0644
+
+    - name: Copy the crt over to the target machine
+      copy:
+         src: "files/ec2_keystore.crt"
+         dest: "/home/ec2-user/"
+         owner: "{{ansible_jdk_user}}"
+         group: "{{ansible_jdk_user}}"
+         mode: 0644
+
+
+    - name: Unpack the jdk package
+      unarchive:
+        src: /home/ec2-user/java/jdk-8u161-linux-x64.tar.gz
+        dest: "{{ansible_jdk_installation_dir}}"
+        creates: /home/ec2-user/java/jdk-8u161-linux-x64/bin/java"
+        force: no
+        copy: no
+      sudo: yes
+
+    - name: setup JAVA_HOME
+      lineinfile:
+        dest: /home/ec2-user/.bashrc
+        line: "export JAVA_HOME=/home/ec2-user/java/jdk-8u161-linux-x64"
+        state: present
+        insertafter: EOF
+        create: true
+
+    - name: append JAVA_HOME to PATH
+      lineinfile:
+        dest: /home/ec2-user/.bashrc
+        line: "export PATH=$JAVA_HOME/bin:$PATH"
+        state: present
+        insertafter: EOF
+        create: true
+
+#    - name: install cert
+#      command: keytool -import -alias ec2 -file /home/ec2-user/ec2_keystore.crt -keystore /home/ec2-user/java/jre/lib/security/cacerts
+
+    - name: Create necessary directory {{ansible_tc_installation_dir}}
+      file: 
+        path={{ansible_tc_installation_dir}} 
+        state=directory
+      sudo: yes
+
+    - name: Copy the tomcat installer over to the target machine
+      copy:
+        src: "files/apache-tomcat-8.5.30.tar.gz"
+        dest: "{{ ansible_tc_installation_dir }}"
+        owner: "{{ansible_tc_user}}"
+        group: "{{ansible_tc_user}}"
+        mode: 0644 
+
+    - name: Unpack the tomcat package
+      unarchive:
+        src: /home/ec2-user/tomcat/apache-tomcat-8.5.30.tar.gz
+        dest: "{{ansible_tc_installation_dir}}"
+        force: no
+        copy: no
+        owner: "{{ansible_tc_user}}"
+        group: "{{ansible_tc_user}}"
+        mode: 0755
+      sudo: yes
+
+    - name: Delete tomcat archive file
+      file: 
+        path=/home/ec2-user/tomcat/apache-tomcat-8.5.30.tar.gz
+        state=absent
+
+    - name: prepare tc parameters
+      template:
+        src: templates/context.xml.j2
+        dest: /home/ec2-user/tomcat/apache-tomcat-8.5.30/webapps/manager/META-INF/context.xml"
+        owner: "{{ansible_tc_user}}"
+        group: "{{ansible_tc_user}}"
+        mode: 0755
+
+    - name: prepare tc parameters
+      template:
+        src: templates/server.xml.j2
+        dest: /home/ec2-user/tomcat/apache-tomcat-8.5.30/conf/server.xml"
+        owner: "{{ansible_tc_user}}"
+        group: "{{ansible_tc_user}}"
+        mode: 0755
+
+    - name: prepare tc parameters
+      template:
+        src: templates/tomcat-users.xml.j2
+        dest: /home/ec2-user/tomcat/apache-tomcat-8.5.30/conf/tomcat-users.xml"
+        owner: "{{ansible_tc_user}}"
+        group: "{{ansible_tc_user}}"
+        mode: 0755
+
+    - name: prepare tc parameters
+      template:
+        src: templates/web.xml.j2
+        dest: /home/ec2-user/tomcat/apache-tomcat-8.5.30/conf/web.xml"
+        owner: "{{ansible_tc_user}}"
+        group: "{{ansible_tc_user}}"
+        mode: 0755
+
+    - name: return motd to registered var
+      command: rm -f /home/ec2-user/tomcat/apache-tomcat-8.5.30/webapps/ROOT/index.html
+
+    - name: Copy the index file over to the target machine
+      copy:
+         src: "files/index.html"
+         dest: "/home/ec2-user/tomcat/apache-tomcat-8.5.30/webapps/ROOT"
+         owner: "{{ansible_jdk_user}}"
+         group: "{{ansible_jdk_user}}"
+         mode: 0644
+
+    - name: prepare tc parameters
+      become: yes
+      become_user: root
+      template:
+        src: templates/tomcat.service.j2
+        dest: "/etc/systemd/system/tomcat.service"
+        mode: 0755  
+      notify:
+       - reload systemd
+
+    - name: enable tomcat startup
+      become: yes
+      become_user: root
+      systemd:
+        name: tomcat
+        enabled: yes
+        state: restarted
+
+#    - name: return motd to registered var
+#      command: sh /home/ec2-user/tomcat/apache-tomcat-8.5.30/bin/startup.sh
